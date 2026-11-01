@@ -9,11 +9,21 @@ CORRECTED VERSION (Blender 5.2 fix, originals untouched): fcurve access is
 now robustly multi-path. On the deployed 5.2.3 build, ``strip.channelbag``
 resolved to a ``bpy_func`` (an RNA function object) instead of the
 channelbag struct, so the old ``channelbag.fcurves`` access raised
-``AttributeError: 'bpy_func' object has no attribute 'fcurves'``. Every
-candidate attribute is now checked (callables are skipped, never called;
-``.fcurves`` must be a real iterable collection), and ``apply_easing``
-degrades to a safe no-op returning False when no fcurve path exists,
-instead of raising.
+``AttributeError: 'bpy_func' object has no attribute 'fcurves'``.
+
+REPAIR (2026-11-02, animation API repair — supersedes the "skip callables"
+approach above, which was itself defective): on Blender 5.2.3,
+``strip.channelbag`` is a *method* that must be called with an Action
+Slot, and ``strip.channelbags`` exposes the strip's channelbag
+collection. The earlier corrected version skipped the callable and never
+tried the collection, so ``_collect_fcurves`` returned an empty list for
+every layered action and ``apply_easing`` silently no-opped (proven by
+runtime probes: a layered action with 6 fcurves / 30 keyframe points
+reported 0). ``_collect_fcurves`` now traverses the channelbags
+collection first, then calls ``channelbag(slot)`` per Action Slot, then
+falls back to the legacy plain-property and direct ``action.fcurves``
+paths; it logs a warning when an action has layered strips but no
+fcurves could be reached, instead of failing silently.
 """
 
 import math
@@ -60,17 +70,71 @@ def _fcurves_from(holder):
         return []
 
 
+def _channelbags_for_strip(strip, action):
+    """All channelbags of a keyframe strip, across Blender API shapes.
+
+    Blender 5.x shapes, tried in order:
+    1. ``strip.channelbags`` — the collection of every channelbag on the
+       strip (one per Action Slot it serves).
+    2. ``strip.channelbag(slot)`` — a method requiring an Action Slot;
+       it is called once per slot of ``action`` (the slot object first,
+       then its handle, then its name) and the bags it returns are kept.
+       This associates each returned channelbag with the Action Slot it
+       belongs to.
+    3. ``strip.channelbag`` as a plain struct property (older builds).
+
+    Bags are de-duplicated by identity. Never raises.
+    """
+    bags = []
+    seen = set()
+
+    def _add(bag):
+        if bag is not None and id(bag) not in seen:
+            seen.add(id(bag))
+            bags.append(bag)
+
+    collection = _safe_getattr(strip, "channelbags")
+    if _is_real_collection(collection):
+        for bag in collection:
+            _add(bag)
+        if bags:
+            return bags
+    raw = _safe_getattr(strip, "channelbag")
+    if raw is not None and callable(raw):
+        slots = _safe_getattr(action, "slots")
+        if _is_real_collection(slots):
+            for slot in list(slots):
+                for arg in (slot, _safe_getattr(slot, "handle"),
+                            _safe_getattr(slot, "name")):
+                    if arg is None:
+                        continue
+                    try:
+                        bag = raw(arg)
+                    except Exception:
+                        continue
+                    if bag is not None:
+                        _add(bag)
+                        break
+    elif raw is not None:
+        _add(raw)
+    return bags
+
+
 def _collect_fcurves(action):
     """All fcurves reachable on ``action`` via any known API path.
 
     Paths tried, in order:
     1. Legacy: ``action.fcurves`` (pre-layered actions).
-    2. Layered (4.4+/5.x): ``action.layers[i].strips[j].channelbag.fcurves``,
-       with the strip itself as a fallback holder.
+    2. Layered (4.4+/5.x): for every layer/strip, the strip's
+       channelbags (see ``_channelbags_for_strip``: the ``channelbags``
+       collection, or ``channelbag(slot)`` called per Action Slot, or a
+       plain ``channelbag`` property), with the strip itself as a final
+       fallback holder.
 
-    Callable attributes (e.g. a ``bpy_func`` where a struct was expected)
-    are skipped, never called. Returns [] when no path exists on this
-    Blender build; never raises for a missing path.
+    Returns [] only when no path yields fcurves on this Blender build;
+    if the action HAS layered strips but nothing was reachable, a
+    warning is logged so the miss is never silent. Never raises for a
+    missing path.
     """
     if action is None:
         return []
@@ -81,16 +145,25 @@ def _collect_fcurves(action):
     layers = _safe_getattr(action, "layers")
     if not _is_real_collection(layers):
         return found
+    saw_strips = False
     for layer in layers:
         strips = _safe_getattr(layer, "strips")
         if not _is_real_collection(strips):
             continue
         for strip in strips:
-            for holder in (_safe_getattr(strip, "channelbag"), strip):
-                fcurves = _fcurves_from(holder)
-                if fcurves:
-                    found.extend(fcurves)
-                    break
+            saw_strips = True
+            strip_curves = []
+            for bag in _channelbags_for_strip(strip, action):
+                strip_curves.extend(_fcurves_from(bag))
+            if not strip_curves:
+                strip_curves = _fcurves_from(strip)
+            found.extend(strip_curves)
+    if saw_strips and not found:
+        log.warning(
+            "_collect_fcurves: action %r has layered strips but no "
+            "fcurves were reachable on this Blender build",
+            _safe_getattr(action, "name") or repr(action),
+        )
     return found
 
 
